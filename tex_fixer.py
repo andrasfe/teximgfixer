@@ -33,7 +33,11 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-VISION_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it")
+
+ANALYST_MODEL = os.getenv("OPENROUTER_MODEL1", "google/gemma-4-31b-it")
+FIXER_MODEL = os.getenv("OPENROUTER_MODEL3", "deepseek/deepseek-v4-pro")
+JUDGE_MODEL = os.getenv("OPENROUTER_MODEL2", "qwen/qwen3.6-35b-a3b")
+
 MAX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "8"))
 RENDER_DPI = int(os.getenv("RENDER_DPI", "300"))
 
@@ -121,97 +125,50 @@ def png_to_base64_data_uri(png_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM analysis & fix
+# Agent 1: Analyst — describes defects only, no fixing
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """\
-You are a LaTeX/TikZ diagram quality inspector and fixer.
+ANALYST_PROMPT = """\
+You are a LaTeX/TikZ diagram visual quality analyst. You ONLY describe defects — you NEVER fix them.
 
-You will be shown a rendered image of a LaTeX TikZ diagram. Your job is to:
+You will be shown a rendered image of a TikZ diagram. Produce a precise, structured defect report.
 
-1. ANALYZE the image for visual defects such as:
-   - Overlapping text or nodes
-   - Clipped or cut-off elements
-   - Lines/arrows crossing through text
-   - Misaligned nodes
-   - Labels that are unreadable or too close together
-   - Any other visual layout problems
+For each defect, specify:
+- WHAT the defect is (overlap, clipping, crossing line, misalignment, etc.)
+- WHERE it is (which nodes/labels/arrows are involved)
+- SEVERITY (critical / moderate / minor)
 
-2. If you find defects, produce a FIXED version of the original TeX code that
-   resolves the issues. CRITICAL RULES FOR FIXES:
-
-   a) NEVER make small incremental tweaks to the same parameters that failed before.
-      If increasing `node distance` by 2mm didn't work last time, increasing it by 4mm
-      won't either. You need a STRUCTURALLY DIFFERENT approach.
-
-   b) PREFER COMPLETE RESTRUCTURING over parameter adjustment:
-      - Replace relative positioning (`below=of X`) with ABSOLUTE coordinates
-        using `\node at (x,y)` where you control exact placement
-      - Use `\coordinate` to define anchor points for arrow routing
-      - Split the diagram into clear horizontal tiers with explicit y-coordinates
-      - Use `column sep` and `row sep` in matrix layouts if appropriate
-
-   c) If nodes overlap vertically, DO NOT just increase `below=` distance.
-      Instead, assign each tier a fixed y-coordinate (e.g., y=0, y=-3, y=-6, etc.)
-      and place nodes at those coordinates.
-
-   d) If group box labels overlap, move them OUTSIDE the box entirely using
-      `label=above:` or place them as separate nodes.
-
-   e) For arrow routing through tight spaces, use explicit `to[out=angle, in=angle]`
-      or `|-` / `-|` operators with intermediate coordinates.
-
-   f) When in doubt, spread things out MUCH more than seems necessary.
-
-3. If the diagram looks correct with NO defects, respond with exactly:
-   DIAGRAM_OK
+If the diagram has NO visual defects, respond with exactly:
+DIAGRAM_OK
 
 Response format (when defects are found):
----ANALYSIS---
-<brief description of defects found>
----FIXED_TEX---
-<the complete corrected TeX code (just the tikzpicture, no \\documentclass)>
+---DEFECTS---
+1. [SEVERITY] <description of defect and which elements are involved>
+2. [SEVERITY] <description>
+...
 ---END---
-
-Response format (when no defects):
-DIAGRAM_OK
 """
 
 
-def analyze_and_fix(client: OpenAI, image_data_uri: str, current_tex: str,
-                     iteration: int = 1, history: Optional[str] = None,
-                     hints: Optional[str] = None) -> dict:
-    """Send the rendered image + current tex to the vision model.
+def run_analyst(client: OpenAI, image_data_uri: str, current_tex: str,
+                iteration: int = 1, hints: Optional[str] = None) -> dict:
+    """Run the Analyst agent: image → defect report.
 
-    Returns dict with keys: ok (bool), analysis (str), fixed_tex (str|None).
+    Returns dict: ok (bool), defects (str), retry (bool).
     """
-    history_note = ""
-    if history:
-        history_note = (
-            f"\n\n--- PREVIOUS ATTEMPTS (iteration {iteration}) ---\n"
-            f"Previous fixes were INSUFFICIENT. The same defects persist.\n"
-            f"You must make MUCH LARGER changes than before.\n\n"
-            f"Previous analysis history:\n{history}"
-        )
-
     hints_note = ""
     if hints:
         hints_note = (
             f"\n\n--- USER HINTS ---\n"
-            f"The user has provided the following guidance for fixing the diagram. "
-            f"You MUST follow these hints as constraints on your fix:\n"
-            f"{hints}"
+            f"The user wants these constraints respected when fixing:\n{hints}"
         )
 
     user_content = [
         {
             "type": "text",
             "text": (
-                f"Here is the rendered image of the current TikZ diagram (iteration {iteration}). "
-                "Analyze it for visual defects and fix the TeX if needed.\n\n"
-                "Current TeX source code:\n\n"
-                f"```latex\n{current_tex}\n```"
-                + history_note
+                f"Analyze this TikZ diagram (iteration {iteration}) for visual defects.\n\n"
+                f"Current TeX source:\n```latex\n{current_tex}\n```"
                 + hints_note
             ),
         },
@@ -222,41 +179,263 @@ def analyze_and_fix(client: OpenAI, image_data_uri: str, current_tex: str,
     ]
 
     response = client.chat.completions.create(
-        model=VISION_MODEL,
+        model=ANALYST_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": ANALYST_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        max_tokens=16000,
-        temperature=0.3,
+        max_tokens=4000,
+        temperature=0.2,
     )
 
     content = response.choices[0].message.content
     if content is None:
-        # Model returned no content — could be filtering, rate limit, or transient error.
-        # Return a retry-able result so the loop can try again.
-        print("  [WARN] Model returned empty content. Will retry.")
-        return {"ok": False, "analysis": "Model returned no content (retry).", "fixed_tex": None, "retry": True}
+        print("  [ANALYST] Empty response — will retry.")
+        return {"ok": False, "defects": "", "retry": True}
 
     text = content.strip()
 
-    if text == "DIAGRAM_OK" or text.endswith("\nDIAGRAM_OK"):
-        return {"ok": True, "analysis": "No defects found.", "fixed_tex": None}
+    if text == "DIAGRAM_OK" or "DIAGRAM_OK" in text:
+        return {"ok": True, "defects": "", "retry": False}
 
-    # Parse structured response
-    analysis_match = re.search(r"---ANALYSIS---\s*\n(.*?)---FIXED_TEX---", text, re.DOTALL)
+    # Extract defect report
+    defects_match = re.search(r"---DEFECTS---\s*\n(.*?)---END---", text, re.DOTALL)
+    defects = defects_match.group(1).strip() if defects_match else text
+
+    return {"ok": False, "defects": defects, "retry": False}
+
+
+# ---------------------------------------------------------------------------
+# Agent 2: Fixer — takes defect report + TeX, produces fixed TeX
+# ---------------------------------------------------------------------------
+
+FIXER_PROMPT = """\
+You are a LaTeX/TikZ diagram fixer. You receive a defect report and the current TeX source.
+Your ONLY job is to produce a corrected version of the TeX that resolves ALL listed defects.
+
+CRITICAL RULES:
+a) NEVER make small incremental tweaks to the same parameters that failed before.
+   If increasing `node distance` by 2mm didn't work, increasing by 4mm won't either.
+   You need a STRUCTURALLY DIFFERENT approach.
+
+b) PREFER COMPLETE RESTRUCTURING over parameter adjustment:
+   - Replace relative positioning (`below=of X`) with ABSOLUTE coordinates using `\\node at (x,y)`
+   - Use `\\coordinate` to define anchor points for arrow routing
+   - Split the diagram into clear horizontal tiers with explicit y-coordinates
+   - Use `column sep` and `row sep` in matrix layouts if appropriate
+
+c) If nodes overlap vertically, assign each tier a fixed y-coordinate
+   (e.g., y=0, y=-3, y=-6, etc.) and place nodes at those coordinates.
+
+d) If group box labels overlap, move them OUTSIDE the box using `label=above:` or
+   place them as separate nodes.
+
+e) For arrow routing through tight spaces, use explicit `to[out=angle, in=angle]`
+   or `|-` / `-|` operators with intermediate coordinates.
+
+f) When in doubt, spread things out MUCH more than seems necessary.
+
+Response format:
+---FIXED_TEX---
+<the complete corrected TeX code (just the tikzpicture, no \\documentclass)>
+---END---
+"""
+
+
+def run_fixer(client: OpenAI, defects: str, current_tex: str,
+              iteration: int = 1, history: Optional[str] = None,
+              hints: Optional[str] = None) -> dict:
+    """Run the Fixer agent: defect report + TeX → fixed TeX.
+
+    Returns dict: fixed_tex (str|None), retry (bool).
+    """
+    history_note = ""
+    if history:
+        history_note = (
+            f"\n\n--- PREVIOUS FIX HISTORY ---\n"
+            f"Previous fixes FAILED to resolve the defects. You must take a DIFFERENT approach.\n"
+            f"Do NOT repeat the same type of changes.\n\n"
+            f"{history}"
+        )
+
+    hints_note = ""
+    if hints:
+        hints_note = (
+            f"\n\n--- USER HINTS ---\n"
+            f"You MUST follow these constraints:\n{hints}"
+        )
+
+    user_msg = (
+        f"Defect report from analyst (iteration {iteration}):\n"
+        f"---DEFECTS---\n{defects}\n---END---\n\n"
+        f"Current TeX source:\n```latex\n{current_tex}\n```"
+        + history_note
+        + hints_note
+    )
+
+    response = client.chat.completions.create(
+        model=FIXER_MODEL,
+        messages=[
+            {"role": "system", "content": FIXER_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        max_tokens=16000,
+        temperature=0.4,
+    )
+
+    content = response.choices[0].message.content
+    if content is None:
+        print("  [FIXER] Empty response — will retry.")
+        return {"fixed_tex": None, "retry": True}
+
+    text = content.strip()
+
+    # Extract fixed TeX
     tex_match = re.search(r"---FIXED_TEX---\s*\n(.*?)---END---", text, re.DOTALL)
-
-    analysis = analysis_match.group(1).strip() if analysis_match else "(could not parse analysis)"
     fixed_tex = tex_match.group(1).strip() if tex_match else None
 
     if fixed_tex is None:
-        # Fallback: try to extract anything between ```latex ... ```
+        # Fallback: extract ```latex ... ```
         code_match = re.search(r"```latex\n(.*?)```", text, re.DOTALL)
         if code_match:
             fixed_tex = code_match.group(1).strip()
 
-    return {"ok": fixed_tex is None, "analysis": analysis, "fixed_tex": fixed_tex}
+    return {"fixed_tex": fixed_tex, "retry": False}
+
+
+# ---------------------------------------------------------------------------
+# Agent 3: Judge — compares before/after images, accepts or rejects fix
+# ---------------------------------------------------------------------------
+
+JUDGE_PROMPT = """\
+You are a LaTeX/TikZ diagram quality judge. You compare a BEFORE and AFTER image of a diagram fix.
+
+Your job:
+1. Check if the defects listed in the defect report are resolved in the AFTER image.
+2. Check if the fix introduced any NEW defects (regressions).
+3. Decide: ACCEPT the fix, or REJECT it (revert to before).
+
+Scoring:
+- Rate defect resolution: IMPROVED / SAME / WORSE
+- Rate new defects: NONE / MINOR / MAJOR
+- Overall verdict: ACCEPT or REJECT
+
+If the AFTER image has NO defects at all (original defects resolved and no new ones),
+respond with DIAGRAM_OK instead.
+
+Response format:
+---VERDICT---
+Resolution: <IMPROVED/SAME/WORSE>
+New defects: <NONE/MINOR/MAJOR>
+Verdict: <ACCEPT/REJECT>
+Reasoning: <1-2 sentences>
+---END---
+"""
+
+
+JUDGE_IMAGE_DIM = int(os.getenv("JUDGE_IMAGE_DIM", "1000"))
+
+
+def png_to_judge_data_uri(png_path: Path) -> str:
+    """Create a smaller data-URI for the Judge (dual-image payload)."""
+    img = Image.open(png_path)
+    if max(img.size) > JUDGE_IMAGE_DIM:
+        ratio = JUDGE_IMAGE_DIM / max(img.size)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    data_uri = f"data:image/png;base64,{b64}"
+    print(f"  Judge image: {len(b64) // 1024} KB base64 ({img.width}x{img.height})")
+    return data_uri
+
+
+def run_judge(client: OpenAI, before_uri: str, after_uri: str,
+              defects: str, hints: Optional[str] = None,
+              use_fallback_model: bool = False) -> dict:
+    """Run the Judge agent: before/after comparison → accept or reject.
+
+    Returns dict: accepted (bool), verdict (str), diagram_ok (bool), retry (bool).
+    """
+    model = ANALYST_MODEL if use_fallback_model else JUDGE_MODEL
+
+    hints_note = ""
+    if hints:
+        hints_note = f"\n\nUser constraints for the diagram:\n{hints}"
+
+    user_content = [
+        {
+            "type": "text",
+            "text": (
+                "Compare BEFORE (original) and AFTER (fixed) versions of a TikZ diagram.\n\n"
+                f"Defects that were supposed to be fixed:\n---DEFECTS---\n{defects}\n---END---\n"
+                + hints_note
+            ),
+        },
+        {
+            "type": "text",
+            "text": "BEFORE image:",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": before_uri},
+        },
+        {
+            "type": "text",
+            "text": "AFTER image:",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": after_uri},
+        },
+    ]
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": JUDGE_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=2000,
+        temperature=0.2,
+    )
+
+    content = response.choices[0].message.content
+    if content is None:
+        print("  [JUDGE] Empty response — will retry.")
+        return {"accepted": False, "verdict": "Judge returned no content", "diagram_ok": False, "retry": True}
+
+    text = content.strip()
+
+    if "DIAGRAM_OK" in text:
+        return {"accepted": True, "verdict": "No defects remaining", "diagram_ok": True, "retry": False}
+
+    # Parse verdict
+    verdict_match = re.search(r"---VERDICT---\s*\n(.*?)---END---", text, re.DOTALL)
+    verdict_text = verdict_match.group(1).strip() if verdict_match else text
+
+    accepted = "Verdict: ACCEPT" in verdict_text
+    diagram_ok = False
+
+    return {"accepted": accepted, "verdict": verdict_text, "diagram_ok": diagram_ok, "retry": False}
+
+
+# ---------------------------------------------------------------------------
+# LLM call helper with retry
+# ---------------------------------------------------------------------------
+
+def llm_with_retry(fn, max_retries=3, **kwargs):
+    """Call an agent function with retry on empty responses."""
+    for attempt in range(1, max_retries + 1):
+        result = fn(**kwargs)
+        if not result.get("retry"):
+            return result
+        if attempt < max_retries:
+            wait = attempt * 5
+            print(f"  Retry {attempt}/{max_retries} after {wait}s...")
+            time.sleep(wait)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +462,20 @@ def run(tex_path: str, output_dir: Optional[str] = None, hints: Optional[str] = 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     current_tex = tex_file.read_text(encoding="utf-8")
-    original_tex = current_tex
+    best_tex = current_tex  # Best accepted version so far
     history_lines = []
+    fix_counter = 0  # Counts accepted fixes (for artifact naming)
+    consecutive_rejects = 0
 
-    print(f"TeX Fixer starting")
-    print(f"  Input:   {tex_file}")
-    print(f"  Output:  {out_dir}")
-    print(f"  Model:   {VISION_MODEL}")
+    print(f"TeX Fixer starting (multi-agent: Analyst → Fixer → Judge)")
+    print(f"  Input:     {tex_file}")
+    print(f"  Output:    {out_dir}")
+    print(f"  Analyst:   {ANALYST_MODEL}")
+    print(f"  Fixer:     {FIXER_MODEL}")
+    print(f"  Judge:     {JUDGE_MODEL}")
     print(f"  Max iters: {MAX_ITERATIONS}")
+    if hints:
+        print(f"  Hints:     {hints}")
     print()
 
     for iteration in range(1, MAX_ITERATIONS + 1):
@@ -299,44 +484,30 @@ def run(tex_path: str, output_dir: Optional[str] = None, hints: Optional[str] = 
         with tempfile.TemporaryDirectory(prefix="texfix_") as tmp:
             work = Path(tmp)
 
-            # Wrap & render
+            # --- Step 1: Render current TeX ---
             full_doc = wrap_tex(current_tex)
             pdf_path = render_tex_to_pdf(full_doc, work)
-            png_path = pdf_to_png(pdf_path)
+            before_png = pdf_to_png(pdf_path)
 
-            # Save iteration artifacts
-            iter_png = out_dir / f"iter_{iteration:02d}.png"
-            iter_tex = out_dir / f"iter_{iteration:02d}.tex"
-            shutil.copy2(png_path, iter_png)
+            # Save before image
+            iter_png = out_dir / f"iter_{iteration:02d}_before.png"
+            iter_tex = out_dir / f"iter_{iteration:02d}_before.tex"
+            shutil.copy2(before_png, iter_png)
             iter_tex.write_text(current_tex, encoding="utf-8")
-            print(f"  Rendered: {iter_png}")
+            print(f"  Rendered (before): {iter_png}")
 
-            # Build history string from previous analyses
-            history = "\n".join(history_lines) if history_lines else None
+            before_uri = png_to_base64_data_uri(before_png)
 
-            # Analyze (with retry for empty model responses)
-            image_uri = png_to_base64_data_uri(png_path)
-            max_retries = 3
-            result = None
-            for attempt in range(1, max_retries + 1):
-                result = analyze_and_fix(client, image_uri, current_tex,
-                                         iteration=iteration, history=history,
-                                         hints=hints)
-                if not result.get("retry"):
-                    break
-                if attempt < max_retries:
-                    wait = attempt * 5
-                    print(f"  Retry {attempt}/{max_retries} after {wait}s...")
-                    time.sleep(wait)
+            # --- Step 2: Analyst — identify defects ---
+            print(f"  [ANALYST] Analyzing image...")
+            analyst_result = llm_with_retry(
+                run_analyst, client=client,
+                image_data_uri=before_uri, current_tex=current_tex,
+                iteration=iteration, hints=hints,
+            )
 
-            print(f"  Analysis: {result['analysis']}")
-
-            # Record this analysis in history for future iterations
-            history_lines.append(f"Iteration {iteration}: {result['analysis']}")
-
-            if result["ok"]:
-                print(f"\n✓ Diagram looks correct after {iteration} iteration(s)!")
-                # Copy final as "final" artifacts
+            if analyst_result["ok"]:
+                print(f"\n✓ Analyst: No defects found after {iteration} iteration(s)!")
                 final_png = out_dir / "final.png"
                 final_tex = out_dir / "final.tex"
                 shutil.copy2(iter_png, final_png)
@@ -345,26 +516,116 @@ def run(tex_path: str, output_dir: Optional[str] = None, hints: Optional[str] = 
                 print(f"  Final TeX: {final_tex}")
                 return
 
-            if result["fixed_tex"] is None:
-                print("  [WARN] Model did not provide fixed TeX. Stopping.")
-                break
+            defects = analyst_result["defects"]
+            print(f"  [ANALYST] Defects found:\n{defects[:300]}...")
 
-            current_tex = result["fixed_tex"]
-            print(f"  Updated TeX ({len(current_tex)} chars)")
+            # Record in history
+            history_lines.append(f"Iteration {iteration} defects: {defects[:200]}")
+            history = "\n".join(history_lines) if history_lines else None
+
+            # --- Step 3: Fixer — produce corrected TeX ---
+            print(f"  [FIXER] Generating fix...")
+            fixer_result = llm_with_retry(
+                run_fixer, client=client,
+                defects=defects, current_tex=current_tex,
+                iteration=iteration, history=history, hints=hints,
+            )
+
+            if fixer_result["fixed_tex"] is None:
+                print("  [FIXER] No fix produced. Skipping to next iteration.")
+                continue
+
+            proposed_tex = fixer_result["fixed_tex"]
+            print(f"  [FIXER] Proposed fix ({len(proposed_tex)} chars)")
+
+            # --- Step 4: Render the proposed fix ---
+            try:
+                proposed_doc = wrap_tex(proposed_tex)
+                proposed_pdf = render_tex_to_pdf(proposed_doc, work)
+                after_png = pdf_to_png(proposed_pdf)
+            except Exception as e:
+                print(f"  [ERROR] Proposed TeX failed to render: {e}")
+                print("  Rejecting fix (compilation error).")
+                consecutive_rejects += 1
+                continue
+
+            after_uri = png_to_base64_data_uri(after_png)
+
+            # Save after image
+            after_iter_png = out_dir / f"iter_{iteration:02d}_after.png"
+            after_iter_tex = out_dir / f"iter_{iteration:02d}_after.tex"
+            shutil.copy2(after_png, after_iter_png)
+            after_iter_tex.write_text(proposed_tex, encoding="utf-8")
+            print(f"  Rendered (after):  {after_iter_png}")
+
+            # --- Step 5: Judge — accept or reject ---
+            # Use smaller images for Judge (dual-image payload)
+            judge_before_uri = png_to_judge_data_uri(before_png)
+            judge_after_uri = png_to_judge_data_uri(after_png)
+
+            print(f"  [JUDGE] Evaluating fix...")
+            judge_result = llm_with_retry(
+                run_judge, client=client,
+                before_uri=judge_before_uri, after_uri=judge_after_uri,
+                defects=defects, hints=hints,
+            )
+
+            # If Judge failed with primary model, try fallback (Analyst model)
+            if judge_result.get("retry") or (not judge_result["accepted"] and "no content" in judge_result.get("verdict", "").lower()):
+                print(f"  [JUDGE] Retrying with fallback model ({ANALYST_MODEL})...")
+                judge_result = llm_with_retry(
+                    run_judge, client=client,
+                    before_uri=judge_before_uri, after_uri=judge_after_uri,
+                    defects=defects, hints=hints,
+                    use_fallback_model=True,
+                )
+
+            print(f"  [JUDGE] {judge_result['verdict'][:200]}")
+
+            if judge_result["diagram_ok"]:
+                print(f"\n✓ Judge: Diagram looks perfect after {iteration} iteration(s)!")
+                final_png = out_dir / "final.png"
+                final_tex = out_dir / "final.tex"
+                shutil.copy2(after_iter_png, final_png)
+                shutil.copy2(after_iter_tex, final_tex)
+                print(f"  Final PNG: {final_png}")
+                print(f"  Final TeX: {final_tex}")
+                return
+
+            if judge_result["accepted"]:
+                current_tex = proposed_tex
+                best_tex = proposed_tex
+                fix_counter += 1
+                consecutive_rejects = 0
+                print(f"  ✓ Fix ACCEPTED ({fix_counter} accepted so far)")
+            else:
+                consecutive_rejects += 1
+                print(f"  ✗ Fix REJECTED — reverting to previous version")
+                # Keep current_tex unchanged (revert)
+                history_lines.append(f"Iteration {iteration} judge: REJECTED — fix made things worse or didn't help")
+
+                # If rejected 3 times in a row, reset to best known version
+                if consecutive_rejects >= 3:
+                    if current_tex != best_tex:
+                        print(f"  [WARN] 3 consecutive rejections. Resetting to best known version.")
+                        current_tex = best_tex
+                        consecutive_rejects = 0
 
     # If we exhausted iterations
     print(f"\n✗ Max iterations ({MAX_ITERATIONS}) reached without convergence.")
-    print(f"  Last version saved as iter_{MAX_ITERATIONS:02d}.tex / .png in {out_dir}")
+    print(f"  Best version saved as final.tex / final.png in {out_dir}")
 
-    # Save whatever we have as final
+    # Save best version as final
     final_png = out_dir / "final.png"
     final_tex = out_dir / "final.tex"
-    last_png = out_dir / f"iter_{MAX_ITERATIONS:02d}.png"
-    last_tex = out_dir / f"iter_{MAX_ITERATIONS:02d}.tex"
-    if last_png.exists():
-        shutil.copy2(last_png, final_png)
-    if last_tex.exists():
-        shutil.copy2(last_tex, final_tex)
+    # Re-render best_tex for the final PNG
+    with tempfile.TemporaryDirectory(prefix="texfix_") as tmp:
+        work = Path(tmp)
+        full_doc = wrap_tex(best_tex)
+        pdf_path = render_tex_to_pdf(full_doc, work)
+        png_path = pdf_to_png(pdf_path)
+        shutil.copy2(png_path, final_png)
+    final_tex.write_text(best_tex, encoding="utf-8")
 
 
 def main():

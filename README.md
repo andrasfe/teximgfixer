@@ -1,6 +1,6 @@
 # TeX Image Fixer
 
-Iterative render → analyze → fix cycle for LaTeX/TikZ diagrams. Renders a `.tex` file, sends the image to a vision-capable LLM for analysis, and loops until the diagram looks correct (no overlapping lines, clipped nodes, etc.).
+Multi-agent iterative fix cycle for LaTeX/TikZ diagrams. Three specialized LLM agents — **Analyst**, **Fixer**, and **Judge** — collaborate to render, diagnose, fix, and validate TikZ diagrams until they look correct.
 
 ## Setup
 
@@ -18,13 +18,21 @@ brew install tectonic
 
 ## Configuration
 
-Create a `.env` file (already gitignored) with your OpenRouter credentials:
+Create a `.env` file (already gitignored) with your OpenRouter credentials and three model assignments:
 
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-OPENROUTER_MODEL=google/gemma-4-31b-it
+OPENROUTER_MODEL1=google/gemma-4-31b-it
+OPENROUTER_MODEL2=qwen/qwen3.6-35b-a3b
+OPENROUTER_MODEL3=deepseek/deepseek-v4-pro
 ```
+
+- **MODEL1** → Analyst (describes defects only)
+- **MODEL2** → Fixer (produces corrected TeX)
+- **MODEL3** → Judge (accepts or rejects fixes)
+
+Using different models for each role provides diverse perspectives and avoids shared blind spots.
 
 Optional overrides:
 
@@ -57,24 +65,32 @@ With user hints:
 
 Artifacts are saved per-iteration in the output directory:
 
-- `iter_01.png` / `iter_01.tex` — first render + analysis
-- `iter_02.png` / `iter_02.tex` — after first fix
+- `iter_01_before.png` / `.tex` — rendered before fix attempt
+- `iter_01_after.png` / `.tex` — rendered after fix attempt
 - ...
-- `final.png` / `final.tex` — converged result (or last iteration)
+- `final.png` / `final.tex` — converged result (or best accepted version)
 
-## How It Works
+## Multi-Agent Architecture
+
+Each iteration follows a **5-step pipeline**:
 
 1. **Render** — Wraps the TikZ fragment in a standalone document, compiles with `tectonic`, converts PDF→PNG
-2. **Analyze** — Sends the rendered image + current TeX source to a vision LLM via OpenRouter
-3. **Fix** — If defects are found, the model produces corrected TeX; the cycle repeats
-4. **Converge** — Stops when the model responds `DIAGRAM_OK` or max iterations reached
+2. **Analyst** — Vision LLM examines the rendered image and produces a structured defect report (what, where, severity). Does NOT fix — this separation prevents biasing the diagnosis toward easy fixes.
+3. **Fixer** — Receives the defect report + current TeX + fix history, produces corrected TeX. Different model from Analyst to avoid shared blind spots. Gets progressively stronger prompts if previous fixes failed.
+4. **Re-render** — The proposed fix is compiled and rendered to PNG. If it fails to compile, the fix is auto-rejected.
+5. **Judge** — Compares before and after images side-by-side. Decides ACCEPT or REJECT. Can detect regressions the Fixer missed. If rejected, the fix is reverted.
 
-The model receives iteration history so it doesn't repeat failed approaches, and user hints are injected as constraints on every fix attempt.
+### Key features:
+- **Fix rejection** — Bad fixes get rolled back instead of becoming the new baseline
+- **Consecutive rejection reset** — After 3 rejections in a row, reverts to the best known version
+- **Best-version tracking** — The final output is always the best accepted version, not the last attempted
+- **Iteration history** — The Fixer sees all previous defect reports and judge verdicts to avoid repeating failed approaches
+- **User hints** — Constraints from `-H` are injected into all three agents
 
 ## Project Structure
 
 ```
-├── .env                # API keys (gitignored)
+├── .env                # API keys + model config (gitignored)
 ├── .gitignore
 ├── .venv/              # Python virtualenv
 ├── requirements.txt
